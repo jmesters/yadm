@@ -6,7 +6,7 @@ end
 set --export BUN_INSTALL "$HOME/.bun"
 set --export PATH $BUN_INSTALL/bin $PATH
 
-/opt/homebrew/bin/zoxide init fish | source
-/opt/homebrew/bin/fzf --fish | source
+zoxide init fish | source
+fzf --fish | source
 
 eval "$(/opt/homebrew/bin/brew shellenv)"
