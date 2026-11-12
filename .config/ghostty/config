@@ -1,0 +1,4 @@
+#theme = catppuccin-mocha
+theme = gruvbox-dark
+mouse-hide-while-typing = true
+window-decoration = true
