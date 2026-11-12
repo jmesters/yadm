@@ -1,0 +1,43 @@
+session_name: dev
+options:
+  automatic-rename: "off"
+  allow-rename: "off"
+  pane-border-status: top
+  pane-border-format: " #{pane_title} "
+
+windows:
+  - window_name: www-iframes
+    start_directory: ~/Documents/GitHub.nosync/www-iframes/apps/
+    layout: main-horizontal
+    shell_command_before:
+      - tmux set-option -g @catppuccin_window_text "#W"
+      - tmux set-option -g @catppuccin_window_current_text "#W"
+    panes:
+      - pane_name: backend
+        shell_command:
+          - cd backend
+          - tmux select-pane -T backend
+          - clear
+      - pane_name: frontend
+        shell_command:
+          - cd frontend
+          - tmux select-pane -T frontend
+          - clear
+
+  - window_name: main
+    start_directory: ~/Documents/GitHub.nosync/main/mono-repo/apps
+    layout: main-horizontal
+    shell_command_before:
+      - tmux set-option -g @catppuccin_window_text "#W"
+      - tmux set-option -g @catppuccin_window_current_text "#W"
+    panes:
+      - pane_name: backend-customer-portal
+        shell_command:
+          - cd backend-customer-portal
+          - tmux select-pane -T backend
+          - clear
+      - pane_name: customer-portal
+        shell_command:
+          - cd customer-portal
+          - tmux select-pane -T frontend
+          - clear
