@@ -2,62 +2,167 @@
 # Sets up a new macOS or Ubuntu/Debian machine after `yadm clone`.
 # yadm offers to run it right after cloning; run it again any time with `yadm bootstrap`.
 # Safe to re-run: it only installs what is missing and never upgrades.
+#   macOS:  Homebrew
+#   Linux:  apt (no recommends, no compiler, no Homebrew) + official release
+#           binaries in ~/.local/bin for what apt lacks or ships too old
 set -euo pipefail
 
 os=$(uname -s)
 log() { printf '\n==> %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+clone() { # clone <url> <dir>, unless it's already there
+  [[ -d $2 ]] || git clone -q --depth 1 "$1" "$2"
+}
 
-load_brew() {
+# ===========================================================================
+# macOS: Homebrew
+# ===========================================================================
+mac_tools() {
   local b
-  for b in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
-    if [[ -x $b ]]; then
-      eval "$("$b" shellenv)"
-      return 0
+  for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    [[ -x $b ]] && eval "$("$b" shellenv)" && break
+  done
+  if ! have brew; then
+    log "Installing Homebrew"
+    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+      [[ -x $b ]] && eval "$("$b" shellenv)" && break
+    done
+  fi
+
+  local formulae=(
+    neovim tmux tmuxp starship zoxide fzf bat eza fastfetch yazi
+    television tuios htop pgcli gh uv
+  )
+  # atuin and herdr are skipped if their own installers already put them in place
+  [[ -x $HOME/.atuin/bin/atuin ]] || formulae+=(atuin)
+  [[ -x $HOME/.local/bin/herdr ]] || formulae+=(herdr)
+
+  local f missing=()
+  for f in "${formulae[@]}"; do
+    brew list --formula "$f" >/dev/null 2>&1 || missing+=("$f")
+  done
+  if ((${#missing[@]})); then
+    log "brew install ${missing[*]}"
+    brew install "${missing[@]}"
+  else
+    log "All command-line tools already installed"
+  fi
+}
+
+# ===========================================================================
+# Linux: apt + release binaries
+# ===========================================================================
+bin=$HOME/.local/bin
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+latest_tag() { # latest_tag <owner/repo>
+  curl -fsSL "https://api.github.com/repos/$1/releases/latest" |
+    sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1
+}
+
+fetch_bin() { # fetch_bin <name> <url> [binaries...]: download and copy binaries to ~/.local/bin
+  local name=$1 url=$2 d="$tmp/$1" b f
+  shift 2
+  (($#)) || set -- "$name"
+  mkdir -p "$d" "$bin"
+  log "$name: $url"
+  curl -fsSL "$url" -o "$d/download"
+  case $url in
+    *.tar.gz) tar -xzf "$d/download" -C "$d" ;;
+    *.zip) unzip -q "$d/download" -d "$d" ;;
+    *) install -m 755 "$d/download" "$bin/$name" && return ;;
+  esac
+  for b in "$@"; do
+    f=$(find "$d" -type f -name "$b" | head -1)
+    [[ -n $f ]] || { echo "$name: no '$b' in the download" >&2; return 1; }
+    install -m 755 "$f" "$bin/$b"
+  done
+}
+
+minor() { # minor <version string>: 0.11.6 -> 11
+  sed -n 's/^[^0-9]*0\.\([0-9]*\).*/\1/p' <<<"$1" | head -1
+}
+
+linux_tools() {
+  have apt-get || { echo "No apt-get: install the tools by hand" >&2; return 0; }
+
+  # --- apt: everything Ubuntu ships in a usable version --------------------
+  local wanted=(
+    zsh git curl ca-certificates unzip
+    tmux tmuxp htop fzf bat eza zoxide fastfetch gh pgcli atuin
+  )
+  local p missing=() unavailable=()
+  for p in "${wanted[@]}"; do
+    dpkg -s "$p" >/dev/null 2>&1 && continue
+    if apt-cache show "$p" >/dev/null 2>&1; then
+      missing+=("$p")
+    else
+      unavailable+=("$p")
     fi
   done
-  return 1
+  if ((${#missing[@]})); then
+    log "apt install ${missing[*]}"
+    sudo apt-get update -q
+    sudo apt-get install -y --no-install-recommends "${missing[@]}"
+  fi
+  ((${#unavailable[@]})) && log "Not in this release's apt: ${unavailable[*]} (downloaded below if needed)"
+
+  # --- release binaries ----------------------------------------------------
+  local arch arm tag
+  arch=$(uname -m) # x86_64 | aarch64
+  case $arch in
+    x86_64) arm=x86_64 ;;
+    aarch64) arm=arm64 ;;
+    *) echo "Unsupported CPU $arch: skipping downloads" >&2; return 0 ;;
+  esac
+  local gh=https://github.com
+  mkdir -p "$bin"
+  export PATH="$bin:$PATH" # so a re-run sees what's already in ~/.local/bin
+
+  # neovim: LazyVim needs 0.11+, older Ubuntus ship less; needs its lib/ folder too
+  if ! have nvim || (($(minor "$(nvim --version | head -1)") < 11)); then
+    log "neovim: latest release"
+    curl -fsSL "$gh/neovim/neovim/releases/latest/download/nvim-linux-$arm.tar.gz" | tar -xz -C "$tmp"
+    mkdir -p "$HOME/.local/opt" "$bin"
+    rm -rf "$HOME/.local/opt/nvim"
+    mv "$tmp/nvim-linux-$arm" "$HOME/.local/opt/nvim"
+    ln -sf "$HOME/.local/opt/nvim/bin/nvim" "$bin/nvim"
+  fi
+
+  # fzf: `fzf --zsh` needs 0.48+ (Ubuntu 24.04 ships 0.44)
+  if ! fzf --zsh >/dev/null 2>&1; then
+    tag=$(latest_tag junegunn/fzf)
+    fetch_bin fzf "$gh/junegunn/fzf/releases/download/$tag/fzf-${tag#v}-linux_${arm/x86_64/amd64}.tar.gz"
+  fi
+
+  # starship: always the release, Ubuntu's (1.22) rejects keys in starship.toml
+  [[ -x $bin/starship ]] || fetch_bin starship "$gh/starship/starship/releases/latest/download/starship-$arch-unknown-linux-musl.tar.gz"
+  have atuin || fetch_bin atuin "$gh/atuinsh/atuin/releases/latest/download/atuin-$arch-unknown-linux-gnu.tar.gz"
+  have uv || fetch_bin uv "$gh/astral-sh/uv/releases/latest/download/uv-$arch-unknown-linux-gnu.tar.gz" uv uvx
+  have yazi || fetch_bin yazi "$gh/sxyazi/yazi/releases/latest/download/yazi-$arch-unknown-linux-gnu.zip" yazi ya
+  have herdr || fetch_bin herdr "$gh/herdrdev/herdr/releases/latest/download/herdr-linux-$arch"
+  if ! have tv; then
+    tag=$(latest_tag alexpasmantier/television)
+    fetch_bin television "$gh/alexpasmantier/television/releases/download/$tag/tv-$tag-$arch-unknown-linux-gnu.tar.gz" tv
+  fi
+  if ! have tuios; then
+    tag=$(latest_tag Gaurav-Gosain/tuios)
+    fetch_bin tuios "$gh/Gaurav-Gosain/tuios/releases/download/$tag/tuios_${tag#v}_Linux_$arm.tar.gz"
+  fi
+  # fastfetch: not in apt before Ubuntu 25.04
+  have fastfetch || fetch_bin fastfetch "$gh/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-${arch/x86_64/amd64}.tar.gz"
+  return 0
 }
 
-clone() { # clone <url> <dir>, unless it's already there
-  [[ -d $2 ]] || git clone --depth 1 "$1" "$2"
-}
+# ===========================================================================
+case $os in
+  Darwin) mac_tools ;;
+  Linux) linux_tools ;;
+esac
 
-# --- 1. Base packages (Ubuntu/Debian) --------------------------------------
-if [[ $os == Linux ]] && have apt-get; then
-  log "apt: zsh, git, curl and Homebrew's build dependencies"
-  sudo apt-get update
-  sudo apt-get install -y zsh git curl build-essential procps file unzip
-fi
-
-# --- 2. Homebrew (macOS and Linux) -----------------------------------------
-if ! load_brew; then
-  log "Installing Homebrew"
-  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  load_brew
-fi
-
-# --- 3. Command-line tools -------------------------------------------------
-formulae=(
-  neovim tmux tmuxp starship zoxide fzf bat eza fastfetch yazi
-  television tuios htop pgcli gh uv
-)
-# atuin and herdr are skipped if their own installers already put them in place
-[[ -x $HOME/.atuin/bin/atuin ]] || formulae+=(atuin)
-[[ -x $HOME/.local/bin/herdr ]] || formulae+=(herdr)
-
-missing=()
-for f in "${formulae[@]}"; do
-  brew list --formula "$f" >/dev/null 2>&1 || missing+=("$f")
-done
-if ((${#missing[@]})); then
-  log "brew install ${missing[*]}"
-  brew install "${missing[@]}"
-else
-  log "All command-line tools already installed"
-fi
-
-# --- 4. Oh My Zsh and its third-party plugins ------------------------------
+# --- Oh My Zsh and its third-party plugins ---------------------------------
 if [[ ! -d $HOME/.oh-my-zsh ]]; then
   log "Installing Oh My Zsh (keeping the tracked .zshrc)"
   RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
@@ -67,7 +172,7 @@ clone https://github.com/hlissner/zsh-autopair "$plugins_dir/zsh-autopair"
 clone https://github.com/zsh-users/zsh-autosuggestions "$plugins_dir/zsh-autosuggestions"
 clone https://github.com/zsh-users/zsh-syntax-highlighting "$plugins_dir/zsh-syntax-highlighting"
 
-# --- 5. tmux plugins (TPM installs the rest from tmux.conf) ----------------
+# --- tmux plugins (TPM installs the rest from tmux.conf) -------------------
 tpm=$HOME/.config/tmux/plugins/tpm
 if [[ ! -d $tpm ]]; then
   log "Installing tmux plugins"
@@ -75,7 +180,7 @@ if [[ ! -d $tpm ]]; then
   "$tpm/bin/install_plugins" || echo "TPM: run prefix + I inside tmux to finish"
 fi
 
-# --- 6. tuios: macOS reads ~/Library/Application Support -------------------
+# --- tuios: macOS reads ~/Library/Application Support ----------------------
 if [[ $os == Darwin ]]; then
   tuios_mac="$HOME/Library/Application Support/tuios/config.toml"
   if [[ ! -e $tuios_mac ]]; then
@@ -86,12 +191,12 @@ if [[ $os == Darwin ]]; then
   fi
 fi
 
-# --- 7. zsh as login shell -------------------------------------------------
+# --- zsh as login shell ----------------------------------------------------
 zsh_path=$(command -v zsh)
-if [[ ${SHELL:-} != */zsh ]]; then
+if [[ $(basename "${SHELL:-}") != zsh ]]; then
   log "Making $zsh_path the login shell"
   grep -qx "$zsh_path" /etc/shells || echo "$zsh_path" | sudo tee -a /etc/shells >/dev/null
-  chsh -s "$zsh_path"
+  chsh -s "$zsh_path" || echo "chsh failed: run 'chsh -s $zsh_path' yourself"
 fi
 
 log "Done. Open a new terminal. Not installed here: safe-chain, deno, bun, rust (their own installers)."
