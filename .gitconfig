@@ -1,0 +1,19 @@
+[filter "lfs"]
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+	process = git-lfs filter-process
+	required = true
+[user]
+	name = Jérôme Mesters
+	email = jerome@mesters.be
+	signingkey = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOe8ZtvfQIS8CRJI81MQKxsgmNACAoFQJxUfsTg1/e8i
+[alias]
+	lg = log --color --graph --pretty=format:'%C(yellow)%h%C(reset) - %s %C(blue)(%cr)%C(reset) %C(cyan)<%an>%C(reset)' --abbrev-commit
+[pull]
+	rebase = true
+[gpg]
+	format = ssh
+[gpg "ssh"]
+	program = /Applications/1Password.app/Contents/MacOS/op-ssh-sign
+[commit]
+	gpgsign = true
