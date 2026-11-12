@@ -1,13 +1,25 @@
-# Login shells: environment and PATH (runs after /etc/zprofile's path_helper).
+# Login shells: environment and PATH (on macOS, runs after /etc/zprofile's path_helper).
+# Works on macOS and Linux; anything not installed is skipped.
 
-eval "$(/opt/homebrew/bin/brew shellenv)"
+# Homebrew: Apple Silicon, Intel macOS, or Linux
+for _brew in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+  if [[ -x $_brew ]]; then
+    eval "$($_brew shellenv)"
+    break
+  fi
+done
+unset _brew
 
 export EDITOR=nvim
 export BUN_INSTALL="$HOME/.bun"
-export PNPM_HOME="$HOME/Library/pnpm"
+if [[ $OSTYPE == darwin* ]]; then
+  export PNPM_HOME="$HOME/Library/pnpm"
+else
+  export PNPM_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/pnpm"
+fi
 
 typeset -U path   # no duplicate PATH entries
-path=(
+_extra=(
   $HOME/.local/bin
   $BUN_INSTALL/bin
   $PNPM_HOME/bin
@@ -15,8 +27,9 @@ path=(
   $HOME/.rbenv/shims
   /opt/homebrew/opt/node/bin
   /Applications/Ghostty.app/Contents/MacOS
-  $path
 )
+path=($^_extra(N-/) $path)   # only the folders that exist on this machine
+unset _extra
 
-. "$HOME/.deno/env"
-. "$HOME/.atuin/bin/env"
+[[ -f $HOME/.deno/env ]] && . "$HOME/.deno/env"
+[[ -f $HOME/.atuin/bin/env ]] && . "$HOME/.atuin/bin/env"

@@ -1,0 +1,5 @@
+# Commit signing with the SSH key in 1Password (macOS app path).
+[gpg "ssh"]
+	program = /Applications/1Password.app/Contents/MacOS/op-ssh-sign
+[commit]
+	gpgsign = true

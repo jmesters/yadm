@@ -1,0 +1,6 @@
+# Commit signing is off on Linux so git works without 1Password.
+# With the 1Password desktop app installed, uncomment to sign like on macOS:
+#[gpg "ssh"]
+#	program = /opt/1Password/op-ssh-sign
+#[commit]
+#	gpgsign = true

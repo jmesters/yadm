@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Sets up a new macOS or Ubuntu/Debian machine after `yadm clone`.
+# yadm offers to run it right after cloning; run it again any time with `yadm bootstrap`.
+# Safe to re-run: it only installs what is missing and never upgrades.
+set -euo pipefail
+
+os=$(uname -s)
+log() { printf '\n==> %s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+load_brew() {
+  local b
+  for b in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+    if [[ -x $b ]]; then
+      eval "$("$b" shellenv)"
+      return 0
+    fi
+  done
+  return 1
+}
+
+clone() { # clone <url> <dir>, unless it's already there
+  [[ -d $2 ]] || git clone --depth 1 "$1" "$2"
+}
+
+# --- 1. Base packages (Ubuntu/Debian) --------------------------------------
+if [[ $os == Linux ]] && have apt-get; then
+  log "apt: zsh, git, curl and Homebrew's build dependencies"
+  sudo apt-get update
+  sudo apt-get install -y zsh git curl build-essential procps file unzip
+fi
+
+# --- 2. Homebrew (macOS and Linux) -----------------------------------------
+if ! load_brew; then
+  log "Installing Homebrew"
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  load_brew
+fi
+
+# --- 3. Command-line tools -------------------------------------------------
+formulae=(
+  neovim tmux tmuxp starship zoxide fzf bat eza fastfetch yazi
+  television tuios htop pgcli gh uv
+)
+# atuin and herdr are skipped if their own installers already put them in place
+[[ -x $HOME/.atuin/bin/atuin ]] || formulae+=(atuin)
+[[ -x $HOME/.local/bin/herdr ]] || formulae+=(herdr)
+
+missing=()
+for f in "${formulae[@]}"; do
+  brew list --formula "$f" >/dev/null 2>&1 || missing+=("$f")
+done
+if ((${#missing[@]})); then
+  log "brew install ${missing[*]}"
+  brew install "${missing[@]}"
+else
+  log "All command-line tools already installed"
+fi
+
+# --- 4. Oh My Zsh and its third-party plugins ------------------------------
+if [[ ! -d $HOME/.oh-my-zsh ]]; then
+  log "Installing Oh My Zsh (keeping the tracked .zshrc)"
+  RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+fi
+plugins_dir=${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins
+clone https://github.com/hlissner/zsh-autopair "$plugins_dir/zsh-autopair"
+clone https://github.com/zsh-users/zsh-autosuggestions "$plugins_dir/zsh-autosuggestions"
+clone https://github.com/zsh-users/zsh-syntax-highlighting "$plugins_dir/zsh-syntax-highlighting"
+
+# --- 5. tmux plugins (TPM installs the rest from tmux.conf) ----------------
+tpm=$HOME/.config/tmux/plugins/tpm
+if [[ ! -d $tpm ]]; then
+  log "Installing tmux plugins"
+  clone https://github.com/tmux-plugins/tpm "$tpm"
+  "$tpm/bin/install_plugins" || echo "TPM: run prefix + I inside tmux to finish"
+fi
+
+# --- 6. tuios: macOS reads ~/Library/Application Support -------------------
+if [[ $os == Darwin ]]; then
+  tuios_mac="$HOME/Library/Application Support/tuios/config.toml"
+  if [[ ! -e $tuios_mac ]]; then
+    mkdir -p "$(dirname "$tuios_mac")"
+    ln -s "$HOME/.config/tuios/config.toml" "$tuios_mac"
+  elif [[ ! -L $tuios_mac ]]; then
+    echo "tuios: $tuios_mac is a real file, not a link to ~/.config/tuios/config.toml; merge them by hand"
+  fi
+fi
+
+# --- 7. zsh as login shell -------------------------------------------------
+zsh_path=$(command -v zsh)
+if [[ ${SHELL:-} != */zsh ]]; then
+  log "Making $zsh_path the login shell"
+  grep -qx "$zsh_path" /etc/shells || echo "$zsh_path" | sudo tee -a /etc/shells >/dev/null
+  chsh -s "$zsh_path"
+fi
+
+log "Done. Open a new terminal. Not installed here: safe-chain, deno, bun, rust (their own installers)."

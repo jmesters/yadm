@@ -13,7 +13,6 @@
 	rebase = true
 [gpg]
 	format = ssh
-[gpg "ssh"]
-	program = /Applications/1Password.app/Contents/MacOS/op-ssh-sign
-[commit]
-	gpgsign = true
+[include]
+	# OS-specific signing settings, picked by yadm alt (signing##os.Darwin / ##os.Linux)
+	path = ~/.config/git/signing
