@@ -1,50 +1,70 @@
 /**
  * Jev router for Anthropic - adapted from pi's examples/extensions/jev-router.ts.
  *
- * Registers the virtual model `jev/auto`. On the first request of a session, the Jev classifier
- * (TypeSafe) rates the user's prompt and picks a model. Every later user prompt is rated again, but
- * the session only ever moves UP a tier (Haiku -> Sonnet -> Opus), never down, and very short
- * prompts ("yes", "fix that") are skipped because they inherit the context's difficulty:
+ * Registers the virtual model `jev/auto`. Policy: over-estimate rather than under-estimate. A weaker
+ * model's mistakes cost rework and review, which is worth more than the token difference.
  *
- * - simple   -> Haiku   (quick questions, small lookups, trivial edits)
- * - standard -> Sonnet  (ordinary features, fixes, reviews)
- * - complex  -> Opus    (subtle design, cross-cutting changes, hard debugging)
+ * - Haiku only when the Jev classifier (TypeSafe) is confident the prompt is simple.
+ * - Opus for everything else, and whenever Jev is missing or fails.
+ * - Sonnet is not used in the main session. Opus can hand well-specified sub-tasks to the `worker`
+ *   subagent (Sonnet, ~/.pi/agent/agents/worker.md) once the higher-level work is done; this
+ *   extension adds that guideline to the system prompt.
  *
- * Opus plans and makes the first edit; after the first successful `edit`/`write`, the session
- * hands over to Sonnet (one prompt-cache miss). Haiku and Sonnet sessions stay where they are.
- * Without TypeSafe credentials (or if Jev fails), the router falls back to Sonnet.
+ * Every later user prompt is rated again, but a session only moves UP (Haiku -> Opus), never down,
+ * and very short prompts ("yes", "fix that") are skipped because they inherit the context's
+ * difficulty. Compaction summaries and other direct requests use Opus too (they shape everything
+ * after them, and an Opus session reuses its prompt cache).
  *
- * The phase is router state, stored on the session branch (survives compaction, follows /tree).
+ * Decisions and fallbacks are logged to ~/.pi/agent/jev-router.log.
  * The selected thinking level passes through to the chosen model.
  *
  * Requires: Anthropic login, TYPESAFE_API_KEY. Usage: pi --model jev/auto
  */
 
+import { appendFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER = "anthropic";
 const MODELS = {
 	simple: "claude-haiku-5-5",
-	standard: "claude-sonnet-5-5",
 	complex: "claude-opus-5-5",
 } as const;
-/** Model that takes over once Opus has made the first edit, and that handles compaction summaries. */
-const IMPLEMENTER = MODELS.standard;
-const FALLBACK = MODELS.standard;
+const FALLBACK = MODELS.complex;
 
-const EDIT_TOOLS = new Set(["edit", "write"]);
+/** Haiku only when `simple` is at least this likely; everything else goes to Opus. */
+const SIMPLE_THRESHOLD = 0.8;
 
 /** Prompts shorter than this are not reclassified (they depend on the existing context). */
 const MIN_RECLASSIFY_CHARS = 40;
+
 const RANK: Record<string, number> = {
 	[MODELS.simple]: 0,
-	[MODELS.standard]: 1,
-	[MODELS.complex]: 2,
+	[MODELS.complex]: 1,
 };
 
+const WORKER_GUIDELINE = [
+	"Delegating sub-tasks: once you have done the higher-level work (understanding the problem, design,",
+	"deciding exactly what to change), you may hand well-specified, self-contained sub-tasks to the `worker`",
+	"subagent (runs on Sonnet) with the `subagent` tool, in parallel mode when they are independent. Give it",
+	"precise instructions (files, expected change, how to verify). Keep design decisions, ambiguous work and",
+	"the final review of its output yourself. Don't delegate when doing the work directly is just as fast.",
+].join(" ");
+
+const LOG_FILE = join(homedir(), ".pi", "agent", "jev-router.log");
+
+/** Append one line to the router log (never throws, never touches the TUI). */
+function log(event: string, data: Record<string, unknown> = {}): void {
+	try {
+		appendFileSync(LOG_FILE, `${new Date().toISOString()} ${event} ${JSON.stringify(data)}\n`);
+	} catch {
+		// logging must never break routing
+	}
+}
+
 interface JevState {
-	phase: "planning" | "implementation";
 	model: string;
 	/** Number of user messages already seen, so each prompt is classified at most once. */
 	userCount?: number;
@@ -58,42 +78,44 @@ function routeTo(request: JevRequest, ctx: ExtensionContext, id: string, state?:
 	return { model, thinkingLevel: request.thinkingLevel, state };
 }
 
-function lastUserText(messages: readonly Message[]): string {
-	const content = messages.filter((message) => message.role === "user").at(-1)?.content ?? "";
-	if (typeof content === "string") return content;
-	return content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
+function textOf(message: Message): string {
+	const c = message.content;
+	if (typeof c === "string") return c;
+	return c.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 }
 
-function editedThisTurn(messages: readonly Message[]): boolean {
-	const lastUser = messages.findLastIndex((message) => message.role === "user");
-	return messages
-		.slice(lastUser + 1)
-		.some((message) => message.role === "toolResult" && EDIT_TOOLS.has(message.toolName) && !message.isError);
-}
-
-function countUserMessages(messages: readonly Message[]): number {
-	return messages.filter((message) => message.role === "user").length;
+function userTexts(messages: readonly Message[]): string[] {
+	return messages.filter((message) => message.role === "user").map(textOf);
 }
 
 async function chooseModel(request: JevRequest, ctx: ExtensionContext): Promise<string> {
-	// Switching to jev/auto mid-session: keep the Anthropic model already in use (no cache miss).
+	// Switching to jev/auto mid-session: keep Opus if already on it (no cache miss); anything else is classified.
 	const previous = request.previous?.model;
-	if (previous?.provider === PROVIDER && Object.values(MODELS).includes(previous.id as never)) return previous.id;
+	if (previous?.provider === PROVIDER && previous.id === MODELS.complex) return MODELS.complex;
 	return classifyPrompt(request, ctx);
 }
 
 async function classifyPrompt(request: JevRequest, ctx: ExtensionContext): Promise<string> {
 	const jev = ctx.modelRegistry.findOfType("classifier", "typesafe", "jev-latest");
-	if (!jev) return FALLBACK;
+	if (!jev) {
+		log("fallback", { reason: "classifier-not-found", model: FALLBACK });
+		return FALLBACK;
+	}
+	const users = userTexts(request.messages);
+	const prompt = users.at(-1) ?? "";
 	try {
 		const result = await ctx.modelRegistry.classify(
 			jev,
 			{
-				state: { prompt: lastUserText(request.messages).slice(0, 16_000) },
+				state: {
+					prompt: prompt.slice(0, 16_000),
+					previous_prompt: users.length > 1 ? users[users.length - 2].slice(0, 1_500) : "",
+				},
 				questions: {
 					complexity: {
 						type: "choice",
-						instructions: "How demanding is the software engineering work requested in `prompt`?",
+						instructions:
+							"How demanding is the software engineering work requested in `prompt`? `previous_prompt` is the user's prior request, for context only; it may be about something unrelated.",
 						criteria: {
 							simple: "Quick questions, small lookups, or trivial one-line edits",
 							standard: "Ordinary features, fixes, reviews, or explanations",
@@ -105,44 +127,56 @@ async function classifyPrompt(request: JevRequest, ctx: ExtensionContext): Promi
 			{ signal: request.signal },
 		);
 		const answer = result.stopReason === "stop" ? result.answers.complexity : undefined;
-		if (answer?.type !== "choice") return FALLBACK;
+		if (answer?.type !== "choice") {
+			log("fallback", { reason: "no-answer", stopReason: result.stopReason, error: result.errorMessage, model: FALLBACK });
+			return FALLBACK;
+		}
 		const p = answer.probabilities;
-		if ((p.complex ?? 0) >= 0.5) return MODELS.complex;
-		if ((p.simple ?? 0) >= 0.6) return MODELS.simple;
-		return MODELS.standard;
-	} catch {
+		const picked = (p.simple ?? 0) >= SIMPLE_THRESHOLD ? MODELS.simple : MODELS.complex;
+		log("classified", { probabilities: p, picked, promptChars: prompt.length });
+		return picked;
+	} catch (error) {
+		log("fallback", { reason: "error", error: String(error), model: FALLBACK });
 		return FALLBACK;
 	}
 }
 
 export default function (pi: ExtensionAPI) {
+	// Tell Opus it may delegate sub-tasks to the Sonnet `worker` subagent.
+	pi.on("before_agent_start", async (event, ctx) => {
+		const onRouterOrOpus = ctx.model?.provider === "jev" || ctx.model?.id === MODELS.complex;
+		const hasSubagent = event.systemPromptOptions?.selectedTools?.includes("subagent") ?? false;
+		if (!onRouterOrOpus || !hasSubagent) return;
+		return { systemPrompt: `${event.systemPrompt}\n\n${WORKER_GUIDELINE}` };
+	});
+
 	pi.registerVirtualModel<JevState>({
 		provider: "jev",
 		id: "auto",
 		name: "Auto (Jev → Claude)",
 		thinkingLevels: ["low", "medium", "high", "xhigh"],
 		async route(request, ctx) {
-			if (request.reason === "direct") return routeTo(request, ctx, IMPLEMENTER);
+			if (request.reason === "direct") {
+				log("direct", { model: MODELS.complex });
+				return routeTo(request, ctx, MODELS.complex);
+			}
+			const userCount = userTexts(request.messages).length;
 			const state = request.state;
-			const userCount = countUserMessages(request.messages);
-			if (!state) {
+			// No state yet, or state from the old 3-tier router (Sonnet): classify from scratch.
+			if (!state || RANK[state.model] === undefined) {
 				const model = await chooseModel(request, ctx);
-				return routeTo(request, ctx, model, { phase: "planning", model, userCount });
+				return routeTo(request, ctx, model, { model, userCount });
 			}
 			// New user prompt: reclassify, but only upgrade (never downgrade, to protect the cache).
 			if (state.userCount !== undefined && userCount > state.userCount) {
 				const next: JevState = { ...state, userCount };
-				if (lastUserText(request.messages).trim().length >= MIN_RECLASSIFY_CHARS) {
+				if (state.model !== MODELS.complex && (userTexts(request.messages).at(-1) ?? "").trim().length >= MIN_RECLASSIFY_CHARS) {
 					const candidate = await classifyPrompt(request, ctx);
 					if ((RANK[candidate] ?? 0) > (RANK[state.model] ?? 0)) {
-						return routeTo(request, ctx, candidate, { phase: "planning", model: candidate, userCount });
+						return routeTo(request, ctx, candidate, { model: candidate, userCount });
 					}
 				}
 				return routeTo(request, ctx, state.model, next);
-			}
-			// Opus made the first edit: hand the rest of the work to Sonnet.
-			if (state.phase === "planning" && state.model === MODELS.complex && editedThisTurn(request.messages)) {
-				return routeTo(request, ctx, IMPLEMENTER, { phase: "implementation", model: IMPLEMENTER, userCount });
 			}
 			// Legacy state (no userCount) or compaction shrinking the history: just resync the counter.
 			return routeTo(request, ctx, state.model, state.userCount === userCount ? undefined : { ...state, userCount });
