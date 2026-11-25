@@ -229,7 +229,7 @@ if have pi; then
   if have jq; then
     mkdir -p "$(dirname "$pi_settings")"
     [[ -s $pi_settings ]] || echo '{}' >"$pi_settings"
-    jq '.defaultProvider = "anthropic" | .defaultModel = "claude-opus-5-5"' "$pi_settings" >"$tmp/pi-settings.json" &&
+    jq '.defaultProvider = "anthropic" | .defaultModel = "claude-opus-5-5" | .theme = "gruvbox"' "$pi_settings" >"$tmp/pi-settings.json" &&
       mv "$tmp/pi-settings.json" "$pi_settings"
   else
     echo "pi: no jq, set defaultModel to anthropic/claude-opus-5-5 by hand"
