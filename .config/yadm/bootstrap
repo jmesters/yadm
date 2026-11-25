@@ -32,7 +32,7 @@ mac_tools() {
 
   local formulae=(
     neovim tmux tmuxp starship zoxide fzf bat eza fastfetch yazi
-    television tuios htop pgcli gh uv
+    television tuios htop pgcli gh uv jq
   )
   # atuin and herdr are skipped if their own installers already put them in place
   [[ -x $HOME/.atuin/bin/atuin ]] || formulae+=(atuin)
@@ -91,7 +91,7 @@ linux_tools() {
   # --- apt: everything Ubuntu ships in a usable version --------------------
   local wanted=(
     zsh git curl ca-certificates unzip
-    tmux tmuxp htop fzf bat eza zoxide fastfetch gh pgcli atuin
+    tmux tmuxp htop fzf bat eza zoxide fastfetch gh pgcli atuin jq
   )
   local p missing=() unavailable=()
   for p in "${wanted[@]}"; do
@@ -188,6 +188,21 @@ if [[ $os == Darwin ]]; then
     ln -s "$HOME/.config/tuios/config.toml" "$tuios_mac"
   elif [[ ! -L $tuios_mac ]]; then
     echo "tuios: $tuios_mac is a real file, not a link to ~/.config/tuios/config.toml; merge them by hand"
+  fi
+fi
+
+# --- pi coding agent: pi-code package and default model --------------------
+# settings.json is not tracked (it holds local paths), so set the keys in place.
+if have pi; then
+  pi list 2>/dev/null | grep -q 'pi-code' || { log "pi: installing pi-code"; pi install npm:pi-code; }
+  pi_settings=$HOME/.pi/agent/settings.json
+  if have jq; then
+    mkdir -p "$(dirname "$pi_settings")"
+    [[ -s $pi_settings ]] || echo '{}' >"$pi_settings"
+    jq '.defaultProvider = "anthropic" | .defaultModel = "claude-opus-5-5"' "$pi_settings" >"$tmp/pi-settings.json" &&
+      mv "$tmp/pi-settings.json" "$pi_settings"
+  else
+    echo "pi: no jq, set defaultModel to anthropic/claude-opus-5-5 by hand"
   fi
 fi
 
