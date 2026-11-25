@@ -32,7 +32,7 @@ mac_tools() {
 
   local formulae=(
     neovim tmux tmuxp starship zoxide fzf bat eza fastfetch yazi
-    television tuios htop pgcli gh uv jq
+    television tuios htop pgcli gh uv jq node
   )
   # atuin and herdr are skipped if their own installers already put them in place
   [[ -x $HOME/.atuin/bin/atuin ]] || formulae+=(atuin)
@@ -90,7 +90,7 @@ linux_tools() {
 
   # --- apt: everything Ubuntu ships in a usable version --------------------
   local wanted=(
-    zsh git curl ca-certificates unzip
+    zsh git curl ca-certificates unzip xz-utils libatomic1
     tmux tmuxp htop fzf bat eza zoxide fastfetch gh pgcli atuin jq
   )
   local p missing=() unavailable=()
@@ -129,6 +129,19 @@ linux_tools() {
     rm -rf "$HOME/.local/opt/nvim"
     mv "$tmp/nvim-linux-$arm" "$HOME/.local/opt/nvim"
     ln -sf "$HOME/.local/opt/nvim/bin/nvim" "$bin/nvim"
+  fi
+
+  # node: pi needs 22.19+, Ubuntu's apt ships 18 (24.04); latest LTS from nodejs.org
+  if ! have node || ! node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>22||(a==22&&b>=19)?0:1)'; then
+    local node_dir
+    tag=$(curl -fsSL https://nodejs.org/dist/index.json | jq -r '[.[] | select(.lts)][0].version')
+    node_dir=node-$tag-linux-${arm/x86_64/x64} # x64 | arm64
+    log "node: $tag (LTS)"
+    curl -fsSL "https://nodejs.org/dist/$tag/$node_dir.tar.xz" | tar -xJ -C "$tmp"
+    mkdir -p "$HOME/.local/opt"
+    rm -rf "$HOME/.local/opt/node"
+    mv "$tmp/$node_dir" "$HOME/.local/opt/node"
+    ln -sf "$HOME/.local/opt/node/bin/"{node,npm,npx} "$bin/"
   fi
 
   # fzf: `fzf --zsh` needs 0.48+ (Ubuntu 24.04 ships 0.44)
@@ -191,7 +204,24 @@ if [[ $os == Darwin ]]; then
   fi
 fi
 
-# --- pi coding agent: pi-code package and default model --------------------
+# --- pi coding agent: pi itself, pi-code package and default model ----------
+# The official installer puts pi in ~/.pi/agent and links ~/.local/bin/pi.
+# It needs Node.js 22.19+:
+#   macOS: Homebrew's node (in the formulae above), found as is.
+#   Linux: the LTS from nodejs.org in ~/.local/opt/node (linux_tools above),
+#          since Ubuntu's apt node is too old.
+# With a terminal it asks to confirm (Enter installs), without one it goes
+# ahead. Piping its output
+# through cat skips its animation and its "Start pi now?" question.
+export PATH="$HOME/.local/bin:$PATH"
+if ! have pi; then
+  log "pi: official installer"
+  if curl -fsSL https://pi.dev/install.sh -o "$tmp/pi-install.sh" && sh "$tmp/pi-install.sh" | cat; then
+    hash -r
+  else
+    echo "pi: install failed; run 'curl -fsSL https://pi.dev/install.sh | sh', then 'yadm bootstrap' again"
+  fi
+fi
 # settings.json is not tracked (it holds local paths), so set the keys in place.
 if have pi; then
   pi list 2>/dev/null | grep -q 'pi-code' || { log "pi: installing pi-code"; pi install npm:pi-code; }
